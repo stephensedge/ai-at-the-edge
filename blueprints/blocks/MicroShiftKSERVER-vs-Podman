@@ -29,16 +29,14 @@
 
 Left: MicroShift + ModelMesh             Right: Podman-only model server containers
 
-
-
 | Feature            | KServe                            | Podman-Only                             |
 | ------------------ | -------------------------------- -| --------------------------------------- |
-| Needs Kubernetes   | ✅ Yes                            | ❌ No                                    |
-| Requires Knative   | ✅ Yes                            | ❌ No                                    |
-| Auto-scaling       | ✅ Built-in                       | ❌ Manual or external                    |
+| Needs Kubernetes   | ✅ Yes                            | ❌ No                                   |
+| Requires Knative   | ✅ Yes                            | ❌ No                                   |
+| Auto-scaling       | ✅ Built-in                       | ❌ Manual or external                   |
 | Best for           | Cloud or cluster-scale inference  | Edge devices or air-gapped environments |
-| Works with systemd | ❌ Not directly                   | ✅ Yes                                   |
-| Lightweight        | ❌ Not really                     | ✅ Extremely light                       |
+| Works with systemd | ❌ Not directly                   | ✅ Yes                                  |
+| Lightweight        | ❌ Not really                     | ✅ Extremely light                      |
 
 Depending upon the model types and if using Podman-based bootable imaages, then we could use these:
 
@@ -326,5 +324,3 @@ podman play kube model-pod.yaml --replace
 TEST:
 curl http://localhost/model-a/predictions/resnet18 -X POST -T test.jpg
 curl http://localhost/model-b/predictions/alexnet -X POST -T test.jpg
-
-
