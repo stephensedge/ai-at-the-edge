@@ -1,0 +1,330 @@
++----------------+                            +----------------+
+|    Client      |                            |    Client      |
++-------+--------+                            +--------+-------+
+        |                                              |
+        v                                              v
++---------------+                            +------------------+
+|    Ingress    |                            |  Reverse Proxy   |
++-------+-------+                            +--------+---------+
+        |                                              |
+        v                                              v
++----------------------------+           +----------------+   +----------------+
+|      Kubernetes Cluster    |           |  Container A   |   |  Container B   |
+|   (MicroShift + ModelMesh) |           |+-------------+|    |+-------------+ |
+|                            |           || Model Server ||   || Model Server ||
+|  +---------------------+   |           |+-------------+|    |+-------------+ |
+|  |   InferenceService  |   |           ||     Model    ||   ||     Model    ||
+|  |  +--------------+   |   |           |+-------------+|    |+-------------+ |
+|  |  | Transformer  |   |   |           +----------------+   +----------------+
+|  |  +--------------+   |   |
+|  |  |  Predictor   |   |   |
+|  |  +--------------+   |   |
+|  +---------------------+   |
+|         ^   ^              |
+|         |   |              |
+|   +-----------+            |
+|   |  Storage  |<-----------+
+|   +-----------+            |
++----------------------------+
+
+Left: MicroShift + ModelMesh             Right: Podman-only model server containers
+
+
+
+| Feature            | KServe                            | Podman-Only                             |
+| ------------------ | -------------------------------- -| --------------------------------------- |
+| Needs Kubernetes   | ✅ Yes                            | ❌ No                                    |
+| Requires Knative   | ✅ Yes                            | ❌ No                                    |
+| Auto-scaling       | ✅ Built-in                       | ❌ Manual or external                    |
+| Best for           | Cloud or cluster-scale inference  | Edge devices or air-gapped environments |
+| Works with systemd | ❌ Not directly                   | ✅ Yes                                   |
+| Lightweight        | ❌ Not really                     | ✅ Extremely light                       |
+
+Depending upon the model types and if using Podman-based bootable imaages, then we could use these:
+
+a. Use Triton or TorchServe directly
+b. Run them rootless in Podman
+c. Expose HTTP inference APIs
+d. Wrap startup in user-level systemd services
+
+Non K8's - Podman
+Commonly seen and used tools:
+_____________________________
+| Component         | Example Options                                    | Purpose                                |
+| ----------------- | -------------------------------------------------- | -------------------------------------- |
+| Model Servers     | `Triton`, `TorchServe`, `TF Serving`, custom Flask | Serve ML models over HTTP/gRPC         |
+| Reverse Proxy     | `NGINX`, `HAProxy`, or `Caddy`                     | Route requests to different models     |
+| Container Runtime | `Podman` (rootless or root)                        | Run isolated workloads on edge devices |
+| Systemd Services  | `~/.config/systemd/user/*.service`                 | Autostart containers at boot           |
+
+          +---------+         +------------------+
+          | Client  | ----->  | Reverse Proxy    |
+          +---------+         +--------+---------+
+                                      |
+              +-----------------------+------------------------+
+              |                        |                        |
+    +----------------+      +----------------+       +----------------+
+    | TorchServe A   |      | TorchServe B   |       | Triton Server  |
+    | /model-a       |      | /model-b       |       | /triton-models |
+    +----------------+      +----------------+       +----------------+
+
+Test Phase Demo Steps
+
+Step 1: Export a Model to .mar format
+Install torch-model-archiver:
+pip install torch-model-archiver torchserve
+
+torch-model-archiver \
+  --model-name resnet18 \
+  --version 1.0 \
+  --model-file model.py \
+  --serialized-file resnet18.pt \
+  --handler image_classifier \
+  --export-path model-store \
+  --force
+
+You will then get: model-store/resnet18.mar
+
+Step 2: Start TorchServe Container with Podman
+podman run -d --name torchserve-model-a \
+  -p 8081:8080 \
+  -v $(pwd)/model-store:/home/model-server/model-store \
+  pytorch/torchserve:latest \
+  torchserve --start --model-store model-store --models resnet18=resnet18.mar
+
+This gives us a REST enpoint:  http://localhost:8081/predictions/resnet18
+
+Step 3: Add NGINX Reverse Proxy Container
+Create a config nginx.conf like this:
+events {}
+
+http {
+  server {
+    listen 80;
+
+    location /model-a {
+      proxy_pass http://localhost:8081/;
+    }
+
+    location /model-b {
+      proxy_pass http://localhost:8082/;
+    }
+  }
+}
+
+then run NGINX (reverse proxy):
+podman run -d --name model-proxy \
+  -p 80:80 \
+  -v $(pwd)/nginx.conf:/etc/nginx/nginx.conf:ro \
+  nginx
+
+TEST:
+curl http://localhost/model-a/predictions/resnet18 -X POST -T image.jpg
+
+
+Step 4: Run with systemd (Rootless) 
+~/.config/systemd/user/torchserve-a.service
+
+#
+[Unit]
+Description=TorchServe Model A
+
+[Service]
+ExecStart=/usr/bin/podman start -a torchserve-model-a
+ExecStop=/usr/bin/podman stop -t 2 torchserve-model-a
+Restart=always
+
+[Install]
+WantedBy=default.target
+
+loginctl enable-linger $USER
+systemctl --user daemon-reexec
+systemctl --user enable --now torchserve-a.service
+#
+
+Do same for the NGINX HAPROXY:
+mkdir -p ~/.config/systemd/user
+
+vim ~/.config/systemd/user/nginx-proxy.service
+#
+[Unit]
+Description=NGINX Reverse Proxy for Model Serving
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/podman start -a model-proxy
+ExecStop=/usr/bin/podman stop -t 2 model-proxy
+Restart=always
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
+#
+(assumption) your container is named model-proxy and already created using:
+podman create --name model-proxy \
+  -p 80:80 \
+  -v /home/kiosk/nginx.conf:/etc/nginx/nginx.conf:ro \
+  nginx
+
+#if not already done allow linger on the rootless / user 
+loginctl enable-linger $USER
+
+Check Status:
+systemctl --user status nginx-proxy.service
+journalctl --user -u nginx-proxy.service -f
+
+Restart the system unit
+systemctl --user restart nginx-proxy.service
+
+_______________________________________________________________________________
+
+                            +----------------------+
+                            |     Podman Host      |
+                            |                      |
+                            |  podman play kube ⬇  |
+                            |                      |
+                            |  +----------------+  |
+                            |  |   Pod (AI Pod) |  |
+                            |  |                |  |
+                            |  |  +----------+  |  |
+         External Requests  |  |  | HAProxy  |◀─┼──┐
+        http://host/model-a |  |  +----------+  |  |
+        http://host/model-b |  |     |   |      |  |
+                            |  |     v   v      |  |
+                            |  |  +------+      |  |
+                            |  |  |Torch A|     |  |
+                            |  |  +------+      |  |
+                            |  |  +------+      |  |
+                            |  |  |Torch B|     |  |
+                            |  |  +------+      |  |
+                            |  +----------------+  |
+                            +----------------------+
+File Structure:
+my-ai-pod/
+├── pod.yaml
+├── haproxy/
+│   ├── haproxy.cfg
+│   └── Dockerfile
+└── model-store/
+    ├── resnet18.mar
+    └── alexnet.mar
+One container pod with 2 model containers (Torch A, and TorchB) Then the HAPROXY container that has a custom route to Model A and Model B.
+Only HAPoxy's port is exposed to the host.
+
+
+Generic Model Independent approach:
+          +-----------------+
+          |    Client       |
+          +--------+--------+
+                   |
+          +--------v--------+
+          |  Podman Pod     |  ← (Single network namespace)
+          | +-------------+ |
+          | | NGINX Proxy |<--------- External port (80)
+          | +------+------+ |
+          |        |        |
+          |  +-----v-----+  |
+          |  | Model A   |  |
+          |  +-----------+  |
+          |  | Model B   |  |
+          |  +-----------+  |
+          +-----------------+
+
+-All containers in the same Podman pod
+-Proxy (nginx-ubi) talks to localhost:port inside the pod
+-Client connects only to NGINX
+
+Images to Use
+Proxy: Red Hat UBI NGINX registry.access.redhat.com/ubi9/nginx-120
+Model A: Example using pytorch/torchserve (you could replace with a UBI-based one or a custom one)
+Model B: Another TorchServe or ONNX Runtime
+
+model-pod.yaml:
+apiVersion: v1
+kind: Pod
+metadata:
+  name: model-serving-pod
+spec:
+  containers:
+
+    - name: nginx-proxy
+      image: registry.access.redhat.com/ubi9/nginx-120
+      ports:
+        - containerPort: 80
+      volumeMounts:
+        - mountPath: /etc/nginx/nginx.conf
+          name: nginx-config
+          subPath: nginx.conf
+
+    - name: model-a
+      image: pytorch/torchserve
+      command:
+        - torchserve
+        - --start
+        - --model-store
+        - /models
+        - --models
+        - resnet18=resnet18.mar
+      volumeMounts:
+        - mountPath: /models
+          name: model-a-store
+
+    - name: model-b
+      image: pytorch/torchserve
+      command:
+        - torchserve
+        - --start
+        - --model-store
+        - /models
+        - --models
+        - alexnet=alexnet.mar
+      volumeMounts:
+        - mountPath: /models
+          name: model-b-store
+
+  volumes:
+    - name: nginx-config
+      hostPath:
+        path: /home/kiosk/nginx/nginx.conf
+
+    - name: model-a-store
+      hostPath:
+        path: /home/kiosk/models/a
+
+    - name: model-b-store
+      hostPath:
+        path: /home/kiosk/models/b
+#
+
+ NGINX Config (/home/kiosk/nginx/nginx.conf)
+#
+events {}
+
+http {
+  server {
+    listen 80;
+
+    location /model-a/ {
+      proxy_pass http://localhost:8081/;
+    }
+
+    location /model-b/ {
+      proxy_pass http://localhost:8082/;
+    }
+  }
+}
+#
+Note: You can modify proxy_pass targets to match the actual internal container ports the model servers listen on. TorchServe defaults to 8080, so you'll want to remap those using port directives in container arguments.
+
+File layout:
+/home/kiosk/nginx/nginx.conf
+/home/kiosk/models/a/resnet18.mar
+/home/kiosk/models/b/alexnet.mar
+
+Launching the pod:
+podman play kube model-pod.yaml --replace
+TEST:
+curl http://localhost/model-a/predictions/resnet18 -X POST -T test.jpg
+curl http://localhost/model-b/predictions/alexnet -X POST -T test.jpg
+
+
